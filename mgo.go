@@ -2,6 +2,7 @@ package mgocli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -14,12 +15,13 @@ import (
 )
 
 type MgoCli struct {
-	client *mongo.Client
+	client   *mongo.Client
+	database string
 }
 
-func New(dial string) (*MgoCli, error) {
+func New(dial string, database string) (*MgoCli, error) {
 	client, err := mongo.Connect(options.Client().ApplyURI(dial))
-	return &MgoCli{client: client}, err
+	return &MgoCli{client: client, database: database}, err
 }
 
 func (mc *MgoCli) Close(ctx context.Context) {
@@ -34,19 +36,19 @@ func (mc *MgoCli) Ping() error {
 }
 
 // CreateCollection if database not exist,it will create it
-func (mc *MgoCli) CreateCollection(ctx context.Context, database, collection string) error {
-	return mc.client.Database(database).CreateCollection(ctx, collection)
+func (mc *MgoCli) CreateCollection(ctx context.Context, collection string) error {
+	return mc.client.Database(mc.database).CreateCollection(ctx, collection)
 }
 
-func (mc *MgoCli) CreateIndex(ctx context.Context, database, collection string, index mongo.IndexModel) error {
-	_, err := mc.client.Database(database).Collection(collection).Indexes().CreateOne(context.TODO(), index)
+func (mc *MgoCli) CreateIndex(ctx context.Context, collection string, index mongo.IndexModel) error {
+	_, err := mc.client.Database(mc.database).Collection(collection).Indexes().CreateOne(ctx, index)
 	return err
 }
 
-func (mc *MgoCli) FindOne(ctx context.Context, database, collection string, filter interface{}, document interface{}) (bool, error) {
-	err := mc.client.Database(database).Collection(collection).FindOne(ctx, filter).Decode(document)
+func (mc *MgoCli) FindOne(ctx context.Context, collection string, filter interface{}, document interface{}) (bool, error) {
+	err := mc.client.Database(mc.database).Collection(collection).FindOne(ctx, filter).Decode(document)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if errors.Is(err, mongo.ErrNoDocuments) {
 			return false, nil
 		}
 		return false, err
@@ -54,8 +56,8 @@ func (mc *MgoCli) FindOne(ctx context.Context, database, collection string, filt
 	return true, nil
 }
 
-func (mc *MgoCli) Find(ctx context.Context, database, collection string, filter interface{}, documents interface{}) error {
-	cursor, err := mc.client.Database(database).
+func (mc *MgoCli) Find(ctx context.Context, collection string, filter interface{}, documents interface{}) error {
+	cursor, err := mc.client.Database(mc.database).
 		Collection(collection).Find(ctx, filter)
 	if err != nil {
 		return err
@@ -66,9 +68,22 @@ func (mc *MgoCli) Find(ctx context.Context, database, collection string, filter 
 	return nil
 }
 
+func (mc *MgoCli) FindPages(ctx context.Context, collection string, filter interface{}, documents interface{}, sort interface{}, skip, limit int64) error {
+	cursor, err := mc.client.Database(mc.database).
+		Collection(collection).Find(ctx, filter,
+		options.Find().SetSort(sort).SetSkip(skip).SetLimit(limit))
+	if err != nil {
+		return err
+	}
+	if err = cursor.All(ctx, documents); err != nil {
+		return err
+	}
+	return nil
+}
+
 // InsertOne
-func (mc *MgoCli) InsertOne(ctx context.Context, database, collection string, document interface{}) (bool, error) {
-	rlt, err := mc.client.Database(database).
+func (mc *MgoCli) InsertOne(ctx context.Context, collection string, document interface{}) (bool, error) {
+	rlt, err := mc.client.Database(mc.database).
 		Collection(collection).
 		InsertOne(ctx, document)
 	if err != nil || !rlt.Acknowledged {
@@ -77,8 +92,21 @@ func (mc *MgoCli) InsertOne(ctx context.Context, database, collection string, do
 	return true, err
 }
 
-func (mc *MgoCli) InsertMany(ctx context.Context, database, collection string, documents interface{}) (int, error) {
-	rlt, err := mc.client.Database(database).
+func (mc *MgoCli) MustInsertOne(ctx context.Context, collection string, document interface{}) error {
+	rlt, err := mc.client.Database(mc.database).
+		Collection(collection).
+		InsertOne(ctx, document)
+	if err != nil {
+		return err
+	}
+	if !rlt.Acknowledged {
+		return fmt.Errorf("could not insert document")
+	}
+	return nil
+}
+
+func (mc *MgoCli) InsertMany(ctx context.Context, collection string, documents interface{}) (int, error) {
+	rlt, err := mc.client.Database(mc.database).
 		Collection(collection).
 		InsertMany(ctx, documents)
 	if err != nil {
@@ -87,9 +115,9 @@ func (mc *MgoCli) InsertMany(ctx context.Context, database, collection string, d
 	return len(rlt.InsertedIDs), err
 }
 
-// MustUpdateById 必须要更新，否则error
-func (mc *MgoCli) MustUpdateById(ctx context.Context, database, collection string, id bson.ObjectID, update bson.D) error {
-	rlt, err := mc.updateById(ctx, database, collection, id, update)
+// MustUpdateById
+func (mc *MgoCli) MustUpdateById(ctx context.Context, collection string, id bson.ObjectID, update bson.D) error {
+	rlt, err := mc.updateById(ctx, collection, id, update)
 	if err != nil {
 		return err
 	}
@@ -99,29 +127,29 @@ func (mc *MgoCli) MustUpdateById(ctx context.Context, database, collection strin
 	return nil
 }
 
-// UpdateById 更新文档数可以为0
-func (mc *MgoCli) UpdateById(ctx context.Context, database, collection string, id bson.ObjectID, update bson.D) error {
-	_, err := mc.updateById(ctx, database, collection, id, update)
+// UpdateById
+func (mc *MgoCli) UpdateById(ctx context.Context, collection string, id bson.ObjectID, update bson.D) error {
+	_, err := mc.updateById(ctx, collection, id, update)
 	return err
 }
 
-func (mc *MgoCli) updateById(ctx context.Context, database, collection string, id bson.ObjectID, update bson.D) (*mongo.UpdateResult, error) {
+func (mc *MgoCli) updateById(ctx context.Context, collection string, id bson.ObjectID, update bson.D) (*mongo.UpdateResult, error) {
 	filter := bson.D{{Key: "_id", Value: id}}
-	return mc.client.Database(database).
+	return mc.client.Database(mc.database).
 		Collection(collection).
 		UpdateOne(ctx, filter, update)
 }
 
-func (mc *MgoCli) Updates(ctx context.Context, database, collection string, filter bson.D, update bson.D) (*mongo.UpdateResult, error) {
-	rlt, err := mc.client.Database(database).
+func (mc *MgoCli) Updates(ctx context.Context, collection string, filter bson.D, update bson.D) (*mongo.UpdateResult, error) {
+	rlt, err := mc.client.Database(mc.database).
 		Collection(collection).
 		UpdateMany(ctx, filter, update)
 
 	return rlt, err
 }
 
-func (mc *MgoCli) MustDeleteById(ctx context.Context, database, collection string, id bson.ObjectID) error {
-	rlt, err := mc.deleteById(ctx, database, collection, id)
+func (mc *MgoCli) MustDeleteById(ctx context.Context, collection string, id bson.ObjectID) error {
+	rlt, err := mc.deleteById(ctx, collection, id)
 	if err != nil {
 		return err
 	}
@@ -131,28 +159,25 @@ func (mc *MgoCli) MustDeleteById(ctx context.Context, database, collection strin
 	return err
 }
 
-func (mc *MgoCli) DeleteById(ctx context.Context, database, collection string, id bson.ObjectID) error {
-	_, err := mc.deleteById(ctx, database, collection, id)
+func (mc *MgoCli) DeleteById(ctx context.Context, collection string, id bson.ObjectID) error {
+	_, err := mc.deleteById(ctx, collection, id)
 	return err
 }
 
-func (mc *MgoCli) deleteById(ctx context.Context, database, collection string, id bson.ObjectID) (*mongo.DeleteResult, error) {
+func (mc *MgoCli) deleteById(ctx context.Context, collection string, id bson.ObjectID) (*mongo.DeleteResult, error) {
 	filter := bson.D{{Key: "_id", Value: id}}
-	return mc.client.Database(database).
+	return mc.client.Database(mc.database).
 		Collection(collection).
 		DeleteOne(ctx, filter)
 }
 
-func (mc *MgoCli) Deletes(ctx context.Context, database, collection string, filter bson.D) (*mongo.DeleteResult, error) {
-	return mc.client.Database(database).
+func (mc *MgoCli) Deletes(ctx context.Context, collection string, filter bson.D) (*mongo.DeleteResult, error) {
+	return mc.client.Database(mc.database).
 		Collection(collection).
 		DeleteMany(ctx, filter)
 }
 
 func (mc *MgoCli) Transaction(ctx context.Context, fn func(ctx context.Context) (interface{}, error)) error {
-	// Transaction 方法会把session注入到ctx中，使用该ctx的方法都能用到事务
-
-	// 事务级别
 	// https://www.mongodb.com/zh-cn/docs/manual/core/transactions/#read-concern-write-concern-read-preference
 	txnOptions := options.Transaction().
 		SetWriteConcern(writeconcern.Majority()).
